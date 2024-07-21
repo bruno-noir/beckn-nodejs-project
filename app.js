@@ -30,16 +30,16 @@ async function fetch_data(query) {
     throw error;
   }
 }
-app.get('/', async (req, res) => {
-    try {
-      await sequelize.authenticate();
-      console.log('Connection has been established successfully.');
-      res.send("Database connection successful!");
-    } catch (error) {
-      console.error('Unable to connect to the database:', error);
-      res.send("Database connection failed.");
-    }
-  });
+// app.get('/', async (req, res) => {
+//     try {
+//       await sequelize.authenticate();
+//       console.log('Connection has been established successfully.');
+//       res.send("Database connection successful!");
+//     } catch (error) {
+//       console.error('Unable to connect to the database:', error);
+//       res.send("Database connection failed.");
+//     }
+//   });
 const dict_target_beneficiary = {
   "0": { "code": "Ind", "name": "Individual" },
   "1": { "code": "MSME", "name": "Enterprise" },
