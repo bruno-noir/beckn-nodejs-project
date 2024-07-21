@@ -3,9 +3,16 @@ const bodyParser = require('body-parser');
 const { Sequelize } = require('sequelize');
 require('dotenv').config();
 const fs = require('fs');
+const axios = require('axios');
+const moment = require('moment');
+const { OpenAI } = require('openai');
 
 const app = express();
 app.use(bodyParser.json());
+
+const openai = new OpenAI({
+  apiKey: process.env.OpenAI_Key
+});
 
 const sequelize = new Sequelize(process.env.DB_NAME, process.env.DB_USER, process.env.DB_PASS, {
   host: process.env.DB_HOST,
@@ -414,7 +421,385 @@ function getLocationIds(applicability_list, loc_list) {
   return applicability_list.filter(item => loc_list.hasOwnProperty(item)).map(item => loc_list[item]);
 }
 
+app.post('/generate-response', async (req, res) => {
+  const now = moment().format();
+  const requestData = req.body;
 
+  fs.appendFileSync('start_time.txt', `${now}\n`);
+
+  const action = getValueFromKey(requestData, 'context.action');
+  const context = getValueFromKey(requestData, 'context');
+
+  if (action === 'search') {
+      const searchByName = getValueFromKey(requestData, 'message.intent.item.descriptor.name');
+      const searchByCat = getValueFromKey(requestData, 'message.intent.provider.categories');
+      let searchParams;
+
+      if (searchByName && searchByName.length !== 0) {
+          searchParams = {
+              action: 'search',
+              search_by: 'scheme_name',
+              search_value: searchByName
+          };
+      } else if (searchByCat && searchByCat.length !== 0) {
+          const searchByCategory = searchByCat[0]['descriptor']['name'];
+          searchParams = {
+              action: 'search',
+              search_by: 'search_by_category',
+              search_value: searchByCategory
+          };
+      }
+
+      if (searchParams) {
+          const searchThread = new Promise((resolve) => {
+              runOnSearchAsync(searchParams, context).then(resolve);
+          });
+
+          searchThread.then(() => {
+              const ackTime = moment().format();
+              fs.appendFileSync('ack_time.txt', `${ackTime}\n`);
+          });
+
+          res.json({
+              message: {
+                  ack: {
+                      status: 'ACK'
+                  }
+              }
+          });
+      } else {
+          res.status(400).json({ status: 'error', message: 'name_value required' });
+      }
+  } else if (action === 'select') {
+      const providers = getValueFromKey(requestData, 'message.order.provider');
+      const items = getValueFromKey(requestData, 'message.order.items');
+
+      if (providers && items) {
+          const selectParams = {
+              action: 'select',
+              provider_id: providers['id'],
+              item_id: items[0]['id']
+          };
+
+          const selectThread = new Promise((resolve) => {
+              runOnSelectAsync(selectParams, context).then(resolve);
+          });
+
+          selectThread.then(() => {
+              const ackTime = moment().format();
+              fs.appendFileSync('ack_time.txt', `${ackTime}\n`);
+          });
+
+          res.json({
+              message: {
+                  ack: {
+                      status: 'ACK'
+                  }
+              }
+          });
+      } else {
+          res.status(400).json({ status: 'error', message: 'name_value required' });
+      }
+  } else {
+      res.status(400).json({ status: 'error', message: 'Invalid action' });
+  }
+});
+
+async function runOnSearchAsync(searchParams, context) {
+  await onSearch(searchParams, context);
+}
+
+async function runOnSelectAsync(selectParams, context) {
+  await onSelect(selectParams, context);
+}
+
+async function onSearch(searchParams, context) {
+  const now = moment().format();
+
+  if (searchParams) {
+      const resData = createSqlAndGetData(searchParams);
+
+      const responseData = getApiResponseFmt("search");
+      responseData["context"] = context;
+      responseData["context"]["action"] = "on_search";
+
+      if (resData) {
+          const contextOnSearch = { ...context, action: "on_search" };
+          const headers = {
+              'Content-Type': 'application/json',
+              'User-Agent': '*/*'
+          };
+
+          const providerData = {};
+          const [locations, locList] = getLocations();
+
+          for (const rows of resData) {
+              const schemeId = rows["id"];
+              const planningDeptGuid = getListFrstGuid(rows['planning_dept']);
+
+              if (!planningDeptGuid) continue;
+
+              if (!providerData[planningDeptGuid]) {
+                  providerData[planningDeptGuid] = {
+                      id: planningDeptGuid,
+                      descriptor: { name: getParameterName(planningDeptGuid) },
+                      categories: [],
+                      locations: [],
+                      items: [],
+                      rateable: false
+                  };
+              }
+
+              const serviceTypeGuid = getListFrstGuid(rows['service_type']);
+              const parName = getParameterName(serviceTypeGuid);
+              const parCode = parName.toLowerCase().replace(" ", "-");
+
+              const categories = { id: serviceTypeGuid, descriptor: { code: parCode, name: parName } };
+
+              if (!providerData[planningDeptGuid]["categories"].includes(categories)) {
+                  providerData[planningDeptGuid]["categories"].push(categories);
+              }
+
+              providerData[planningDeptGuid]["locations"] = locations;
+
+              const items = {
+                  id: rows["guid"],
+                  descriptor: { name: trimStateCode(rows["name"]), long_desc: rows["description"] },
+                  price: { currency: "INR", value: String(rows["pp_gov_fee"]) },
+                  rateable: false,
+                  tags: getSchTags(schemeId, rows["target_beneficiary"], rows["scheme_type"]),
+                  category_ids: [serviceTypeGuid],
+                  location_ids: getLocationIds(JSON.parse(rows['applicability']), locList),
+                  time: { duration: rows["time_line"] || "" }
+              };
+
+              providerData[planningDeptGuid]["items"].push(items);
+          }
+
+          responseData["message"]["catalog"]["providers"] = Object.values(providerData);
+
+          const response = await axios.post('https://demo-bpp-client.haqdarshak.com/on_search', responseData, { headers });
+      }
+  }
+}
+
+async function onSelect(selectParams, context) {
+  const now = moment().format();
+
+  if (selectParams) {
+      const resData = createSqlAndGetData(selectParams);
+
+      const responseData = getApiResponseFmt("select");
+      responseData["context"] = context;
+      responseData["context"]["action"] = "on_select";
+
+      if (resData) {
+          const contextOnSelect = { ...context, action: "on_select" };
+          const headers = {
+              'Content-Type': 'application/json',
+              'User-Agent': '*/*'
+          };
+
+          const providerData = {};
+          const [locations, locList] = getLocations();
+
+          for (const rows of resData) {
+              const schemeId = rows["id"];
+              const planningDeptGuid = getListFrstGuid(rows['planning_dept']);
+
+              if (!planningDeptGuid) continue;
+
+              providerData[planningDeptGuid] = providerData[planningDeptGuid] || {
+                  id: planningDeptGuid,
+                  descriptor: { name: getParameterName(planningDeptGuid) },
+                  locations: [],
+                  fulfillments: [],
+                  items: [],
+                  rateable: false
+              };
+
+              providerData[planningDeptGuid]["locations"] = locations;
+
+              const fulfillmentsList = getFulfillmentsData(schemeId);
+              providerData[planningDeptGuid]["fulfillments"] = fulfillmentsList;
+
+              const items = {
+                  id: rows["guid"],
+                  descriptor: { name: trimStateCode(rows["name"]), long_desc: rows["description"] },
+                  price: { currency: "INR", value: String(rows["pp_gov_fee"]) },
+                  rateable: false,
+                  tags: getSchTags(schemeId, rows["target_beneficiary"], rows["scheme_type"]),
+                  location_ids: getLocationIds(JSON.parse(rows['applicability']), locList),
+                  time: { duration: rows["time_line"] || "" }
+              };
+
+              providerData[planningDeptGuid]["items"].push(items);
+          }
+
+          responseData["message"]["order"]["providers"] = Object.values(providerData);
+
+          const response = await axios.post('https://demo-bpp-client.haqdarshak.com/on_select', responseData, { headers });
+      }
+  }
+}
+
+async function createSqlAndGetData(searchParams) {
+  const action = searchParams['action'];
+
+  if (action === 'search') {
+      const searchBy = searchParams['search_by'];
+      await fs.appendFile("searchBy.txt", String(searchBy));
+
+      if (searchBy === "scheme_name") {
+          await fs.appendFile("searchBy.txt", String(searchBy));
+          const searchValue = searchParams['search_value'];
+
+          let searchTagsList;
+          if (searchValue === "all_schemes") {
+              searchTagsList = ["all_schemes"];
+          } else {
+              const searchTags = getTagsByPersona(searchValue);
+              searchTagsList = JSON.parse(searchTags);
+          }
+
+          await fs.appendFile("searchTagsList.txt", String(searchTagsList));
+          let common_schemes = null;
+
+          for (const searchKey of searchTagsList) {
+              let q;
+              if (searchKey === "all_schemes") {
+                  q = `SELECT s.id FROM schemes s 
+                  JOIN schemes_langs sl ON sl.scheme_id = s.id AND sl.lang = 'en'
+                  WHERE s.status=5 AND s.country_code = "KE" GROUP BY s.id`;
+              } else {
+                  q = `SELECT s.id FROM schemes s 
+                  JOIN schemes_langs sl ON sl.scheme_id = s.id AND sl.lang = 'en'
+                  WHERE 
+                  (sl.name LIKE "%${searchKey}%" OR sl.description LIKE "%${searchKey}%" OR sl.process LIKE "%${searchKey}%" OR sl.benefit LIKE "%${searchKey}%" OR sl.objective LIKE "%${searchKey}%") AND
+                  s.status=5 AND s.country_code = "KE" GROUP BY s.id`;
+              }
+
+              const rows = await fetch_data(q);
+              await fs.appendFile("common_schemes_not.txt", JSON.stringify(rows));
+
+              const current_schemes = new Set(rows.map(row => row.id));
+              if (common_schemes === null) {
+                  common_schemes = current_schemes;
+              } else {
+                  common_schemes = new Set([...common_schemes].filter(x => current_schemes.has(x)));
+              }
+          }
+
+          await fs.appendFile("common_schemes.txt", JSON.stringify([...common_schemes]));
+
+          if (common_schemes.size) {
+              const common_schemes_str = [...common_schemes].join(',');
+              const q = `SELECT s.id, s.guid, s.value, s.pp_gov_fee, s.target_beneficiary, s.scheme_type, s.applicability,
+                  s.time_line, s.fulfillment_touchpoint, IF(s.planning_dept='', '["PM0001M0"]', s.planning_dept) AS planning_dept, s.service_type,
+                  sl.name, sl.description, sl.process, sl.benefit 
+              FROM schemes s 
+              JOIN schemes_langs sl ON sl.scheme_id = s.id AND sl.lang = 'en'
+              LEFT JOIN scheme_rules sr ON sr.scheme_id = s.id
+              WHERE s.status=5 AND s.id IN(${common_schemes_str}) GROUP BY s.id`;
+
+              await fs.appendFile("rows.txt", q);
+              const rows = await fetch_data(q);
+              await fs.appendFile("rows1.txt", JSON.stringify(rows));
+              return rows;
+          } else {
+              const planning_dept = get_srch_tags_planning_dept_det(searchValue);
+              if (planning_dept !== null) {
+                  const q = `SELECT s.id, s.guid, s.value, s.pp_gov_fee, s.target_beneficiary, s.scheme_type, s.applicability,
+                      s.time_line, s.fulfillment_touchpoint, IF(s.planning_dept='', '["PM0001M0"]', s.planning_dept) AS planning_dept, s.service_type,
+                      sl.name, sl.description, sl.process, sl.benefit 
+                  FROM schemes s 
+                  JOIN schemes_langs sl ON sl.scheme_id = s.id AND sl.lang = 'en'
+                  LEFT JOIN scheme_rules sr ON sr.scheme_id = s.id
+                  WHERE s.status=5 AND s.planning_dept LIKE '%${planning_dept}%' AND s.country_code = "KE" GROUP BY s.id`;
+                  const rows = await fetch_data(q);
+                  return rows;
+              } else {
+                  return [];
+              }
+          }
+      } else if (searchBy === "search_by_category") {
+          const searchValue = searchParams['search_value'];
+          await fs.appendFile("searchValue.txt", String(searchValue));
+
+          const serviceTypeMapping = {
+              "health insurance": "PM0001LO",
+              "social assistance": "PM0001LP",
+              "non- health insurance": "PM0001LQ",
+              "agriculture(including loans)": "PM0001LR",
+              "energy": "PM0001LS",
+              "savings and investment": "PM0001LT",
+              "education(including education loan)": "PM0001LU",
+              "health care": "PM0001LV",
+              "loan/credit for self employment/enterprise": "PM0001LW",
+              "issue new document": "PM0001LX",
+              "update / correct document": "PM0001LY"
+          };
+          const serviceTypeCode = serviceTypeMapping[searchValue.toLowerCase()] || '';
+
+          const q = `SELECT s.id, s.guid, s.value, s.pp_gov_fee, s.target_beneficiary, s.scheme_type, s.applicability,
+              s.time_line, s.fulfillment_touchpoint, IF(s.planning_dept='', '["PM0001M0"]', s.planning_dept) AS planning_dept, s.service_type,
+              sl.name, sl.description, sl.process, sl.benefit 
+              FROM schemes s 
+              JOIN schemes_langs sl ON sl.scheme_id = s.id AND sl.lang = 'en'
+              WHERE s.service_type LIKE "%${serviceTypeCode}%" AND s.status = 5
+              GROUP BY s.id`;
+
+          const rows = await fetch_data(q);
+          await fs.appendFile("rows.txt", JSON.stringify(rows));
+          await fs.appendFile("query.txt", q);
+          return rows;
+      }
+  } else if (action === 'select') {
+      const provider_id = searchParams['provider_id'];
+      const item_id = searchParams['item_id'];
+
+      const q = `SELECT s.id, s.guid, s.value, s.pp_gov_fee, s.target_beneficiary, s.scheme_type, s.applicability,
+          s.time_line, s.fulfillment_touchpoint, IF(s.planning_dept='', '["PM0001M0"]', s.planning_dept) AS planning_dept, s.service_type,
+          sl.name, sl.description, sl.process, sl.benefit 
+      FROM schemes s 
+      JOIN schemes_langs sl ON sl.scheme_id = s.id AND sl.lang = 'en'
+      LEFT JOIN scheme_rules sr ON sr.scheme_id = s.id
+      WHERE s.guid = '${item_id}'
+      GROUP BY s.id`;
+
+      const rows = await fetch_data(q);
+      await fs.appendFile("rows.txt", q + JSON.stringify(rows));
+      return rows;
+  }
+
+  await connection.end();
+}
+
+async function getTagsByPersona(data) {
+  const message = data;
+
+  const systemMessage = "I am having database of schemes and I want to search words in that database. So I want that exact words from given text which is provided, do not give other words which are not in the text. give me only words not sentence in object.exclude word scheme/schemes if there.exclude verbs. list should be ['first word', 'second word', etc] without keys:";
+
+  const messages = [
+      { role: "system", content: systemMessage },
+      { role: "user", content: message }
+  ];
+
+  try {
+      const response = await openai.chat.completions.create({
+          model: 'gpt-3.5-turbo',
+          messages: messages
+      });
+
+      const reply = response.choices[0].message.content;
+      messages.push({ role: "assistant", content: reply });
+
+      return reply;
+  } catch (error) {
+      console.error('Error fetching data from OpenAI:', error);
+      throw error;
+  }
+}
   
 app.listen(3000, () => {
   console.log('Server is running on port 3000');
