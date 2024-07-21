@@ -30,16 +30,16 @@ async function fetch_data(query) {
     throw error;
   }
 }
-// app.get('/', async (req, res) => {
-//     try {
-//       await sequelize.authenticate();
-//       console.log('Connection has been established successfully.');
-//       res.send("Database connection successful!");
-//     } catch (error) {
-//       console.error('Unable to connect to the database:', error);
-//       res.send("Database connection failed.");
-//     }
-//   });
+app.get('/', async (req, res) => {
+    try {
+      await sequelize.authenticate();
+      console.log('Connection has been established successfully.');
+      res.send("Database connection successful!");
+    } catch (error) {
+      console.error('Unable to connect to the database:', error);
+      res.send("Database connection failed.");
+    }
+  });
 const dict_target_beneficiary = {
   "0": { "code": "Ind", "name": "Individual" },
   "1": { "code": "MSME", "name": "Enterprise" },
@@ -431,46 +431,86 @@ app.post('/generate-response', async (req, res) => {
   const context = getValueFromKey(requestData, 'context');
 
   if (action === 'search') {
-      const searchByName = getValueFromKey(requestData, 'message.intent.item.descriptor.name');
-      const searchByCat = getValueFromKey(requestData, 'message.intent.provider.categories');
-      let searchParams;
+    const searchByName = getValueFromKey(requestData, 'message.intent.item.descriptor.name');
+    const searchByCat = getValueFromKey(requestData, 'message.intent.provider.categories');
+    const searchByDesc = getValueFromKey(requestData, 'message.intent.fulfillment.customer.person.gender');
+    const searchByTags = getValueFromKey(requestData, 'message.intent.item.tags');
 
-      if (searchByName && searchByName.length !== 0) {
-          searchParams = {
-              action: 'search',
-              search_by: 'scheme_name',
-              search_value: searchByName
-          };
-      } else if (searchByCat && searchByCat.length !== 0) {
-          const searchByCategory = searchByCat[0]['descriptor']['name'];
-          searchParams = {
-              action: 'search',
-              search_by: 'search_by_category',
-              search_value: searchByCategory
-          };
-      }
+    let searchParams = {};
 
-      if (searchParams) {
-          const searchThread = new Promise((resolve) => {
-              runOnSearchAsync(searchParams, context).then(resolve);
-          });
+    // Check if search by name is provided
+    if (searchByName && searchByName.length !== 0) {
+        searchParams = {
+            action: 'search',
+            search_by: 'scheme_name',
+            search_value: searchByName
+        };
+    } 
+    // Check if search by category is provided
+    else if (searchByCat && searchByCat.length !== 0) {
+        const searchByCategory = searchByCat[0]['descriptor']['name'];
+        searchParams = {
+            action: 'search',
+            search_by: 'search_by_category',
+            search_value: searchByCategory
+        };
+    } 
+    // Check if search by description (gender) is provided
+    else if (searchByDesc && searchByDesc.length !== 0) {
+        searchParams = {
+            action: 'search',
+            search_by: 'description',
+            description: searchByDesc
+        };
+    } 
+    // Check if search by tags is provided
+    else if (searchByTags && searchByTags.length !== 0) {
+        const tags = searchByTags.reduce((acc, tag) => {
+            acc[tag['descriptor']['name']] = tag['list'][0]['value'];
+            return acc;
+        }, {});
+        searchParams = {
+            action: 'search',
+            search_by: 'tags',
+            tags: tags
+        };
 
-          searchThread.then(() => {
-              const ackTime = moment().format();
-              fs.appendFileSync('ack_time.txt', `${ackTime}\n`);
-          });
+        // Check for search_by_com (Language and disease)
+        const searchByLanguage = tags.languages;
+        const searchByDisease = tags.disease;
 
-          res.json({
-              message: {
-                  ack: {
-                      status: 'ACK'
-                  }
-              }
-          });
-      } else {
-          res.status(400).json({ status: 'error', message: 'name_value required' });
-      }
-  } else if (action === 'select') {
+        if (searchByLanguage && searchByDisease) {
+            searchParams = {
+                action: 'search',
+                search_by: 'com',
+                language: searchByLanguage,
+                disease: searchByDisease
+            };
+        }
+    }
+
+    // If search parameters are set, start the search thread
+    if (Object.keys(searchParams).length !== 0) {
+        const searchThread = new Promise((resolve) => {
+            runOnSearchAsync(searchParams, context).then(resolve);
+        });
+
+        searchThread.then(() => {
+            const ackTime = moment().format();
+            fs.appendFileSync('ack_time.txt', `${ackTime}\n`);
+        });
+
+        res.json({
+            message: {
+                ack: {
+                    status: 'ACK'
+                }
+            }
+        });
+    } else {
+        res.status(400).json({ status: 'error', message: 'name_value required' });
+    }
+} else if (action === 'select') {
       const providers = getValueFromKey(requestData, 'message.order.provider');
       const items = getValueFromKey(requestData, 'message.order.items');
 
@@ -648,10 +688,10 @@ async function createSqlAndGetData(searchParams) {
 
   if (action === 'search') {
       const searchBy = searchParams['search_by'];
-      await fs.appendFile("searchBy.txt", String(searchBy));
+      await fs.appendFileSync("searchBy.txt", String(searchBy));
 
       if (searchBy === "scheme_name") {
-          await fs.appendFile("searchBy.txt", String(searchBy));
+          await fs.appendFileSync("searchBy.txt", String(searchBy));
           const searchValue = searchParams['search_value'];
 
           let searchTagsList;
@@ -662,7 +702,7 @@ async function createSqlAndGetData(searchParams) {
               searchTagsList = JSON.parse(searchTags);
           }
 
-          await fs.appendFile("searchTagsList.txt", String(searchTagsList));
+          await fs.appendFileSync("searchTagsList.txt", String(searchTagsList));
           let common_schemes = null;
 
           for (const searchKey of searchTagsList) {
@@ -680,7 +720,7 @@ async function createSqlAndGetData(searchParams) {
               }
 
               const rows = await fetch_data(q);
-              await fs.appendFile("common_schemes_not.txt", JSON.stringify(rows));
+              await fs.appendFileSync("common_schemes_not.txt", JSON.stringify(rows));
 
               const current_schemes = new Set(rows.map(row => row.id));
               if (common_schemes === null) {
@@ -690,7 +730,7 @@ async function createSqlAndGetData(searchParams) {
               }
           }
 
-          await fs.appendFile("common_schemes.txt", JSON.stringify([...common_schemes]));
+          await fs.appendFileSync("common_schemes.txt", JSON.stringify([...common_schemes]));
 
           if (common_schemes.size) {
               const common_schemes_str = [...common_schemes].join(',');
@@ -702,9 +742,9 @@ async function createSqlAndGetData(searchParams) {
               LEFT JOIN scheme_rules sr ON sr.scheme_id = s.id
               WHERE s.status=5 AND s.id IN(${common_schemes_str}) GROUP BY s.id`;
 
-              await fs.appendFile("rows.txt", q);
+              await fs.appendFileSync("rows.txt", q);
               const rows = await fetch_data(q);
-              await fs.appendFile("rows1.txt", JSON.stringify(rows));
+              await fs.appendFileSync("rows1.txt", JSON.stringify(rows));
               return rows;
           } else {
               const planning_dept = get_srch_tags_planning_dept_det(searchValue);
@@ -724,7 +764,7 @@ async function createSqlAndGetData(searchParams) {
           }
       } else if (searchBy === "search_by_category") {
           const searchValue = searchParams['search_value'];
-          await fs.appendFile("searchValue.txt", String(searchValue));
+          await fs.appendFileSync("searchValue.txt", String(searchValue));
 
           const serviceTypeMapping = {
               "health insurance": "PM0001LO",
@@ -750,8 +790,8 @@ async function createSqlAndGetData(searchParams) {
               GROUP BY s.id`;
 
           const rows = await fetch_data(q);
-          await fs.appendFile("rows.txt", JSON.stringify(rows));
-          await fs.appendFile("query.txt", q);
+          await fs.appendFileSync("rows.txt", JSON.stringify(rows));
+          await fs.appendFileSync("query.txt", q);
           return rows;
       }
   } else if (action === 'select') {
@@ -768,7 +808,7 @@ async function createSqlAndGetData(searchParams) {
       GROUP BY s.id`;
 
       const rows = await fetch_data(q);
-      await fs.appendFile("rows.txt", q + JSON.stringify(rows));
+      await fs.appendFileSync("rows.txt", q + JSON.stringify(rows));
       return rows;
   }
 
